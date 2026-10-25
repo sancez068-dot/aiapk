@@ -113,7 +113,7 @@ class MainActivity : Activity() {
         try { Shizuku.addRequestPermissionResultListener(shizukuPermissionListener) } catch (_: Exception) { }
         if (intent?.action == Intent.ACTION_ASSIST) {
             taskDraft = intent.getStringExtra(Intent.EXTRA_TEXT)
-                ?: intent.getCharSequenceExtra(Intent.EXTRA_ASSIST_INPUT_HINT_KEY)?.toString().orEmpty()
+                ?: intent.getCharSequenceExtra("android.intent.extra.ASSIST_INPUT_HINT_KEY")?.toString().orEmpty()
             if (taskDraft.isBlank()) taskDraft = "Помоги выполнить задачу на телефоне"
             screen = Screen.HOME
         }
