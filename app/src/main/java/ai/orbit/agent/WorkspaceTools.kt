@@ -5,6 +5,8 @@ import android.content.Intent
 import android.net.Uri
 import android.content.pm.PackageManager
 import android.os.Build
+import android.webkit.MimeTypeMap
+import androidx.documentfile.provider.DocumentFile
 import org.json.JSONArray
 import org.json.JSONObject
 import java.io.BufferedReader
@@ -26,10 +28,52 @@ import java.util.zip.ZipOutputStream
 class WorkspaceTools(private val context: Context) {
     val root: File = File(context.getExternalFilesDir(null) ?: context.filesDir, "orbit_workspace").canonicalFile
     private val cacheTmp = File(context.cacheDir, "orbit_tmp").apply { mkdirs() }
+    private val externalPrefs = context.getSharedPreferences("orbit_external_access", Context.MODE_PRIVATE)
+    @Volatile private var activeProjectRel: String = "workflow/project-session"
 
-    init { root.mkdirs() }
+    init {
+        root.mkdirs()
+        File(root, "workflow").mkdirs()
+        File(root, activeProjectRel).mkdirs()
+    }
 
-    fun execute(name: String, args: JSONObject, allowCommands: Boolean): String = try {
+    fun beginProject(task: String): String {
+        val workflow = File(root, "workflow").apply { mkdirs() }
+        val slug = NativeCore.projectSlug(task.take(240))
+        val baseName = "project-$slug"
+        var target = File(workflow, baseName)
+        var suffix = 2
+        while (target.exists()) {
+            target = File(workflow, "$baseName-$suffix")
+            suffix++
+        }
+        require(target.mkdirs()) { "Не удалось создать отдельную папку проекта: ${target.name}" }
+        activeProjectRel = "workflow/${target.name}"
+        return activeProjectRel
+    }
+
+    fun currentProjectPath(): String = activeProjectRel
+
+    fun hasExternalFolder(): Boolean {
+        val folder = externalRoot() ?: return false
+        return runCatching { folder.exists() && folder.canRead() && folder.canWrite() }.getOrDefault(false)
+    }
+
+    fun selectedExternalFolderName(): String {
+        val rootDoc = externalRoot()?.takeIf { runCatching { it.exists() && it.canRead() && it.canWrite() }.getOrDefault(false) }
+            ?: return "Папка не выбрана или доступ отозван"
+        return rootDoc.name ?: "Выбранная папка"
+    }
+
+    fun setExternalFolder(uri: Uri) {
+        externalPrefs.edit().putString("tree_uri", uri.toString()).apply()
+    }
+
+    private fun selectedTreeUri(): Uri? = externalPrefs.getString("tree_uri", null)?.let { runCatching { Uri.parse(it) }.getOrNull() }
+
+    private fun externalRoot(): DocumentFile? = selectedTreeUri()?.let { DocumentFile.fromTreeUri(context, it) }
+
+    fun execute(name: String, args: JSONObject, allowCommands: Boolean, allowShizukuCommands: Boolean = false): String = try {
         when (name) {
             "workspace_info" -> workspaceInfo()
             "workspace_list" -> listFiles(args.optString("path", ""))
@@ -39,6 +83,14 @@ class WorkspaceTools(private val context: Context) {
             "workspace_delete" -> deletePath(args.getString("path"))
             "workspace_zip" -> zipPath(args.getString("path"), args.optString("output", ""))
             "workspace_unzip" -> unzipPath(args.getString("archive"), args.optString("destination", ""))
+            "external_folder_info" -> externalFolderInfo()
+            "external_list" -> externalList(args.optString("path", ""))
+            "external_read" -> externalRead(args.getString("path"), args.optInt("max_chars", 12000))
+            "external_write" -> externalWrite(args.getString("path"), args.getString("content"), args.optBoolean("append", false))
+            "external_mkdir" -> externalMkdir(args.getString("path"))
+            "external_delete" -> externalDelete(args.getString("path"))
+            "shizuku_command" -> if (allowShizukuCommands) shizukuCommand(args.getString("command")) else
+                "Отклонено: команды через Shizuku выключены в настройках ORBIT."
             "web_search" -> webSearch(args.getString("query"))
             "web_fetch" -> webFetch(args.getString("url"), args.optInt("max_chars", 10000))
             "run_command" -> if (allowCommands) runCommand(args.getString("command")) else
@@ -78,8 +130,32 @@ class WorkspaceTools(private val context: Context) {
         return dest
     }
 
+    fun createItemArchive(relativePath: String): File {
+        val source = safePath(relativePath)
+        require(source.exists()) { "Объект не найден: $relativePath" }
+        val dest = File(cacheTmp, "orbit-item-${System.currentTimeMillis()}.zip")
+        ZipOutputStream(dest.outputStream().buffered()).use { zip ->
+            if (source.isFile) {
+                zip.putNextEntry(ZipEntry(source.name))
+                source.inputStream().use { it.copyTo(zip) }
+                zip.closeEntry()
+            } else {
+                source.walkTopDown().filter { it.isFile }.forEach { file ->
+                    val relative = source.toPath().relativize(file.toPath()).toString().replace(File.separatorChar, '/')
+                    zip.putNextEntry(ZipEntry("${source.name}/$relative"))
+                    file.inputStream().use { it.copyTo(zip) }
+                    zip.closeEntry()
+                }
+            }
+        }
+        return dest
+    }
+
     private fun workspaceInfo(): String = JSONObject()
         .put("workspace_path", root.absolutePath)
+        .put("current_project", activeProjectRel)
+        .put("native_library_loaded", NativeCore.isLoaded())
+        .put("external_folder", selectedExternalFolderName())
         .put("bytes_used", workspaceBytes())
         .put("human_size", humanBytes(workspaceBytes()))
         .put("files", root.walkTopDown().count { it.isFile })
@@ -87,7 +163,7 @@ class WorkspaceTools(private val context: Context) {
         .toString(2)
 
     private fun listFiles(path: String): String {
-        val directory = safePath(path)
+        val directory = safePath(taskPath(path))
         if (!directory.exists()) return "Папка не существует: ${rel(directory)}"
         if (!directory.isDirectory) return "Это не папка: ${rel(directory)}"
         val entries = directory.listFiles()?.sortedWith(compareBy<File>({ !it.isDirectory }, { it.name.lowercase(Locale.ROOT) })).orEmpty()
@@ -104,7 +180,7 @@ class WorkspaceTools(private val context: Context) {
     }
 
     private fun readFile(path: String, maxChars: Int): String {
-        val file = safePath(path)
+        val file = safePath(taskPath(path))
         require(file.exists()) { "Файл не найден: $path" }
         require(file.isFile) { "Путь не является файлом: $path" }
         require(file.length() <= 2_000_000L) { "Файл больше 2 МБ; прочитай его частями или уменьши файл." }
@@ -117,7 +193,7 @@ class WorkspaceTools(private val context: Context) {
     private fun writeFile(path: String, content: String, append: Boolean): String {
         require(path.isNotBlank()) { "path не может быть пустым" }
         require(content.length <= 1_000_000) { "Один вызов записи ограничен 1 000 000 символов." }
-        val file = safePath(path)
+        val file = safePath(taskPath(path))
         file.parentFile?.mkdirs()
         if (append) file.appendText(content, Charsets.UTF_8) else file.writeText(content, Charsets.UTF_8)
         return JSONObject().put("ok", true).put("path", rel(file)).put("bytes", file.length())
@@ -125,15 +201,15 @@ class WorkspaceTools(private val context: Context) {
     }
 
     private fun makeDirectory(path: String): String {
-        val file = safePath(path)
+        val file = safePath(taskPath(path))
         require(file.mkdirs() || file.isDirectory) { "Не удалось создать папку $path" }
         return "Папка готова: ${rel(file)}"
     }
 
     private fun deletePath(path: String): String {
         require(path.isNotBlank() && path != "." && path != "/") { "Удаление корня workspace запрещено." }
-        val file = safePath(path)
-        require(file != root) { "Удаление корня workspace запрещено." }
+        val file = safePath(taskPath(path))
+        require(file != root && file.absolutePath != File(root, "workflow").canonicalPath) { "Удаление корня workspace/workflow запрещено." }
         require(file.exists()) { "Объект не найден: $path" }
         val count = file.walkBottomUp().count()
         require(file.deleteRecursively()) { "Android не смог удалить ${rel(file)}" }
@@ -141,12 +217,12 @@ class WorkspaceTools(private val context: Context) {
     }
 
     private fun zipPath(path: String, output: String): String {
-        val source = safePath(path)
+        val source = safePath(taskPath(path))
         require(source.exists()) { "Источник не найден: $path" }
         val destRel = output.ifBlank {
             if (source.isDirectory) "${source.name.ifBlank { "workspace" }}.zip" else "${source.name}.zip"
         }
-        val destination = safePath(destRel)
+        val destination = safePath(taskPath(destRel))
         require(destination != source) { "Архив не может перезаписать исходный файл." }
         require(!(source.isDirectory && destination.canonicalPath.startsWith(source.canonicalPath + File.separator))) {
             "Архив нельзя создавать внутри архивируемой папки. Сохрани ZIP рядом с ней."
@@ -171,9 +247,9 @@ class WorkspaceTools(private val context: Context) {
     }
 
     private fun unzipPath(archivePath: String, destinationPath: String): String {
-        val archive = safePath(archivePath)
+        val archive = safePath(taskPath(archivePath))
         require(archive.isFile) { "Архив не найден: $archivePath" }
-        val destination = safePath(destinationPath.ifBlank { archive.nameWithoutExtension })
+        val destination = safePath(taskPath(destinationPath.ifBlank { archive.nameWithoutExtension }))
         destination.mkdirs()
         var extracted = 0
         ZipInputStream(archive.inputStream().buffered()).use { zip ->
@@ -192,6 +268,136 @@ class WorkspaceTools(private val context: Context) {
             }
         }
         return JSONObject().put("ok", true).put("destination", rel(destination)).put("files_extracted", extracted).toString()
+    }
+
+    private fun externalFolderInfo(): String {
+        val folder = externalRoot()?.takeIf { runCatching { it.exists() && it.canRead() }.getOrDefault(false) }
+            ?: return JSONObject().put("selected", false)
+                .put("message", "Папка общего хранилища не выбрана или доступ отозван. В ORBIT открой Файлы → Выбрать папку; Android покажет системное окно разрешения.").toString(2)
+        return JSONObject().put("selected", true).put("name", folder.name ?: "Выбранная папка")
+            .put("uri", selectedTreeUri().toString()).put("read", folder.canRead()).put("write", folder.canWrite()).toString(2)
+    }
+
+    private fun externalList(path: String): String {
+        val directory = externalResolve(path, createParents = false)
+            ?: return "Путь не найден внутри выбранной папки: $path"
+        require(directory.isDirectory) { "Это не папка: $path" }
+        val entries = directory.listFiles().sortedBy { it.name?.lowercase(Locale.ROOT).orEmpty() }
+        val array = JSONArray()
+        entries.take(200).forEach { item ->
+            array.put(JSONObject().put("name", item.name ?: "unnamed")
+                .put("type", if (item.isDirectory) "directory" else "file")
+                .put("bytes", if (item.isFile) item.length() else 0L))
+        }
+        return JSONObject().put("folder", path).put("entries", array).put("truncated", entries.size > 200).toString(2)
+    }
+
+    private fun externalRead(path: String, maxChars: Int): String {
+        val file = externalResolve(path, createParents = false)
+            ?: throw IllegalArgumentException("Файл не найден внутри выбранной папки: $path")
+        require(file.isFile) { "Это не файл: $path" }
+        require(file.length() <= 2_000_000L) { "Файл больше 2 МБ; используйте меньший файл." }
+        val bytes = context.contentResolver.openInputStream(file.uri)?.use { input ->
+            val output = java.io.ByteArrayOutputStream()
+            val buffer = ByteArray(8192)
+            var total = 0
+            while (true) {
+                val count = input.read(buffer)
+                if (count < 0) break
+                total += count
+                require(total <= 2_000_000) { "Файл больше 2 МБ; выбери меньший текстовый файл." }
+                output.write(buffer, 0, count)
+            }
+            output.toByteArray()
+        } ?: throw IllegalStateException("Android не открыл файл для чтения.")
+        val text = bytes.toString(Charsets.UTF_8)
+        val cap = maxChars.coerceIn(500, 20_000)
+        return JSONObject().put("path", path).put("bytes", bytes.size).put("content", text.take(cap))
+            .put("truncated", text.length > cap).toString(2)
+    }
+
+    private fun externalWrite(path: String, content: String, append: Boolean): String {
+        require(path.isNotBlank()) { "path не может быть пустым." }
+        require(content.length <= 1_000_000) { "Одна запись ограничена 1 000 000 символов." }
+        val parts = externalParts(path)
+        require(parts.isNotEmpty()) { "Нельзя перезаписать выбранную корневую папку." }
+        val rootDoc = externalRoot() ?: return noExternalAccess()
+        var parent = rootDoc
+        for (part in parts.dropLast(1)) {
+            parent = parent.findFile(part) ?: parent.createDirectory(part)
+                ?: throw IllegalStateException("Не удалось создать папку: $part")
+            require(parent.isDirectory) { "Путь содержит файл вместо папки: $part" }
+        }
+        val name = parts.last()
+        var target = parent.findFile(name)
+        if (target?.isDirectory == true) throw IllegalArgumentException("По указанному пути уже существует папка: $path")
+        if (target == null) {
+            val ext = name.substringAfterLast('.', "").lowercase(Locale.ROOT)
+            val mime = MimeTypeMap.getSingleton().getMimeTypeFromExtension(ext) ?: "application/octet-stream"
+            target = parent.createFile(mime, name) ?: throw IllegalStateException("Не удалось создать файл: $path")
+        }
+        val mode = if (append) "wa" else "wt"
+        context.contentResolver.openOutputStream(target.uri, mode)?.bufferedWriter(Charsets.UTF_8)?.use { it.write(content) }
+            ?: throw IllegalStateException("Android не открыл файл для записи.")
+        return JSONObject().put("ok", true).put("path", path).put("bytes", target.length())
+            .put("mode", if (append) "append" else "overwrite").toString(2)
+    }
+
+    private fun externalMkdir(path: String): String {
+        val parts = externalParts(path)
+        require(parts.isNotEmpty()) { "Путь к папке пустой." }
+        val rootDoc = externalRoot() ?: return noExternalAccess()
+        var parent = rootDoc
+        for (part in parts) {
+            parent = parent.findFile(part) ?: parent.createDirectory(part)
+                ?: throw IllegalStateException("Не удалось создать папку: $part")
+            require(parent.isDirectory) { "Путь содержит файл вместо папки: $part" }
+        }
+        return "Папка создана/уже существует: $path"
+    }
+
+    private fun externalDelete(path: String): String {
+        val parts = externalParts(path)
+        require(parts.isNotEmpty()) { "Удалять выбранную корневую папку запрещено." }
+        val rootDoc = externalRoot() ?: return noExternalAccess()
+        var parent = rootDoc
+        for (part in parts.dropLast(1)) {
+            parent = parent.findFile(part) ?: throw IllegalArgumentException("Папка не найдена: $part")
+            require(parent.isDirectory) { "Это не папка: $part" }
+        }
+        val target = parent.findFile(parts.last()) ?: throw IllegalArgumentException("Объект не найден: $path")
+        require(target.uri != rootDoc.uri) { "Удаление выбранной корневой папки запрещено." }
+        require(target.delete()) { "Android не смог удалить: $path" }
+        return "Удалено из выбранной папки: $path"
+    }
+
+    private fun externalResolve(path: String, createParents: Boolean): DocumentFile? {
+        val parts = externalParts(path)
+        var current = externalRoot() ?: return null
+        for (part in parts) {
+            val next = current.findFile(part)
+            if (next == null) {
+                if (!createParents) return null
+                current = current.createDirectory(part) ?: return null
+            } else current = next
+        }
+        return current
+    }
+
+    private fun externalParts(path: String): List<String> {
+        val normalized = path.trim().replace('\\', '/')
+        require(NativeCore.isRelativePathSafe(normalized) && !normalized.startsWith('/')) {
+            "Ожидается относительный безопасный путь внутри выбранной папки."
+        }
+        return normalized.split('/').filter { it.isNotBlank() && it != "." }
+    }
+
+    private fun noExternalAccess(): String = "Доступ не выдан. В ORBIT открой вкладку «Файлы» и нажми «Выбрать папку для файлов агента», затем выбери нужную папку в системном окне Android."
+
+    private fun shizukuCommand(command: String): String {
+        require(command.isNotBlank()) { "Команда пустая." }
+        require(command.length <= 8_000) { "Команда слишком длинная." }
+        return ShizukuSupport.execute(context, command, File(root, activeProjectRel).absolutePath)
     }
 
     private fun webSearch(query: String): String {
@@ -317,12 +523,14 @@ class WorkspaceTools(private val context: Context) {
             "Команда заблокирована защитным фильтром. Системные изменения из агента запрещены."
         }
         val process = ProcessBuilder("/system/bin/sh", "-c", command)
-            .directory(root)
+            .directory(File(root, activeProjectRel).takeIf { it.isDirectory } ?: root)
             .redirectErrorStream(true)
             .apply {
-                environment()["HOME"] = root.absolutePath
+                val project = File(root, activeProjectRel).takeIf { it.isDirectory } ?: root
+                environment()["HOME"] = project.absolutePath
                 environment()["TMPDIR"] = cacheTmp.absolutePath
                 environment()["ORBIT_WORKSPACE"] = root.absolutePath
+                environment()["ORBIT_PROJECT"] = project.absolutePath
             }
             .start()
         val output = StringBuilder()
@@ -341,10 +549,18 @@ class WorkspaceTools(private val context: Context) {
         }
         reader.join(2000)
         val captured = synchronized(output) { output.toString().take(16000) }
-        return JSONObject().put("exit_code", process.exitValue()).put("output", captured).put("cwd", root.absolutePath).toString(2)
+        return JSONObject().put("exit_code", process.exitValue()).put("output", captured).put("cwd", File(root, activeProjectRel).absolutePath).toString(2)
+    }
+
+    private fun taskPath(relative: String): String {
+        val cleaned = relative.trim().removePrefix("./")
+        if (cleaned == "workflow" || cleaned.startsWith("workflow/")) return cleaned
+        if (!NativeCore.isRelativePathSafe(cleaned)) throw IllegalArgumentException("Небезопасный относительный путь: $relative")
+        return if (cleaned.isBlank() || cleaned == ".") activeProjectRel else "$activeProjectRel/$cleaned"
     }
 
     private fun safePath(relative: String): File {
+        require(NativeCore.isRelativePathSafe(relative)) { "Путь содержит запрещённый сегмент: $relative" }
         val cleaned = relative.trim().removePrefix("./").trimStart('/')
         val target = File(root, cleaned.ifBlank { "." }).canonicalFile
         require(target == root || target.path.startsWith(root.path + File.separator)) {

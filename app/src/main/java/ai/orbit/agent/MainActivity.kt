@@ -2,15 +2,19 @@ package ai.orbit.agent
 
 import android.app.Activity
 import android.app.AlertDialog
+import android.app.role.RoleManager
 import android.content.Intent
 import android.graphics.Color
 import android.graphics.Typeface
 import android.graphics.drawable.GradientDrawable
 import android.net.Uri
 import android.os.Bundle
+import android.os.Build
 import android.os.Handler
 import android.os.Looper
 import android.provider.Settings
+import android.provider.DocumentsContract
+import androidx.documentfile.provider.DocumentFile
 import android.text.InputType
 import android.text.method.PasswordTransformationMethod
 import android.view.Gravity
@@ -25,6 +29,8 @@ import android.widget.LinearLayout
 import android.widget.ScrollView
 import android.widget.TextView
 import android.widget.Toast
+import android.content.pm.PackageManager
+import rikka.shizuku.Shizuku
 import org.json.JSONArray
 import org.json.JSONObject
 import java.io.File
@@ -38,15 +44,15 @@ class MainActivity : Activity() {
     private enum class Screen { HOME, FILES, SETTINGS }
     private enum class Approval { ALLOW, ALLOW_ALL, DENY }
 
-    private val ink = Color.rgb(242, 246, 255)
-    private val muted = Color.rgb(151, 163, 187)
-    private val bgColor = Color.rgb(11, 16, 32)
-    private val surface = Color.rgb(20, 28, 48)
-    private val surfaceRaised = Color.rgb(26, 36, 60)
-    private val accent = Color.rgb(118, 231, 215)
-    private val violet = Color.rgb(140, 155, 255)
-    private val warning = Color.rgb(255, 190, 105)
-    private val danger = Color.rgb(255, 125, 140)
+    private val ink = Color.rgb(27, 35, 48)
+    private val muted = Color.rgb(99, 109, 125)
+    private val bgColor = Color.rgb(246, 247, 249)
+    private val surface = Color.WHITE
+    private val surfaceRaised = Color.rgb(239, 242, 247)
+    private val accent = Color.rgb(37, 99, 235)
+    private val violet = Color.rgb(83, 93, 176)
+    private val warning = Color.rgb(166, 102, 18)
+    private val danger = Color.rgb(190, 45, 58)
 
     private lateinit var settingsStore: SettingsStore
     private lateinit var secrets: SecureSecretStore
@@ -59,6 +65,13 @@ class MainActivity : Activity() {
     private var lastResult = ""
     private var activeTaskName = ""
     private var currentTask: Future<*>? = null
+    private var currentDirectoryRel = ""
+    private var pendingExternalFolderLatch: CountDownLatch? = null
+    private data class PendingAgentWrite(val fileName: String, val content: String, val latch: CountDownLatch, val result: AtomicReference<String>)
+    private data class PendingAgentDelete(val requestedPath: String, val latch: CountDownLatch, val result: AtomicReference<String>)
+    private var pendingAgentWrite: PendingAgentWrite? = null
+    private var pendingAgentDelete: PendingAgentDelete? = null
+    private var pendingExportIsTemp = false
     @Volatile private var activeEngine: AgentEngine? = null
     @Volatile private var approveAllForTask = false
     @Volatile private var taskRunning = false
@@ -77,23 +90,50 @@ class MainActivity : Activity() {
     private var autoApproveCheck: CheckBox? = null
     private var allowCommandsCheck: CheckBox? = null
     private var rememberChoicesCheck: CheckBox? = null
+    private var allowShizukuCheck: CheckBox? = null
+
+    private val shizukuPermissionListener = Shizuku.OnRequestPermissionResultListener { requestCode, grantResult ->
+        if (requestCode == ShizukuSupport.REQUEST_CODE) {
+            val granted = grantResult == PackageManager.PERMISSION_GRANTED
+            if (granted) runCatching { ShizukuSupport.bindIfAllowed(this) }
+            Toast.makeText(this, if (granted) "Доступ Shizuku разрешён" else "Доступ Shizuku отклонён", Toast.LENGTH_SHORT).show()
+            if (screen == Screen.SETTINGS) render()
+        }
+    }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         window.statusBarColor = bgColor
-        window.navigationBarColor = bgColor
+        window.navigationBarColor = Color.WHITE
+        window.decorView.systemUiVisibility = View.SYSTEM_UI_FLAG_LIGHT_STATUS_BAR or View.SYSTEM_UI_FLAG_LIGHT_NAVIGATION_BAR
         window.setSoftInputMode(WindowManager.LayoutParams.SOFT_INPUT_ADJUST_RESIZE)
         settingsStore = SettingsStore(this)
         secrets = SecureSecretStore(this)
         workspace = WorkspaceTools(this)
+        try { Shizuku.addRequestPermissionResultListener(shizukuPermissionListener) } catch (_: Exception) { }
+        if (intent?.action == Intent.ACTION_ASSIST) {
+            taskDraft = intent.getStringExtra(Intent.EXTRA_TEXT)
+                ?: intent.getCharSequenceExtra(Intent.EXTRA_ASSIST_INPUT_HINT_KEY)?.toString().orEmpty()
+            if (taskDraft.isBlank()) taskDraft = "Помоги выполнить задачу на телефоне"
+            screen = Screen.HOME
+        }
         loadMemory()
         render()
     }
 
+    override fun onResume() {
+        super.onResume()
+        if (ShizukuSupport.hasPermission()) runCatching { ShizukuSupport.bindIfAllowed(this) }
+    }
+
     override fun onDestroy() {
+        try { Shizuku.removeRequestPermissionResultListener(shizukuPermissionListener) } catch (_: Exception) { }
         super.onDestroy()
         if (isFinishing) {
             activeEngine?.stop()
+            pendingExternalFolderLatch?.countDown()
+            pendingAgentWrite?.let { it.result.set("Операция прервана: ORBIT закрыт."); it.latch.countDown() }
+            pendingAgentDelete?.let { it.result.set("Операция прервана: ORBIT закрыт."); it.latch.countDown() }
         }
     }
 
@@ -107,7 +147,7 @@ class MainActivity : Activity() {
             view.setPadding(0, insets.systemWindowInsetTop, 0, insets.systemWindowInsetBottom)
             insets
         }
-        root.addView(buildHeader(), LinearLayout.LayoutParams(-1, dp(76)))
+        root.addView(buildHeader(), LinearLayout.LayoutParams(-1, dp(68)))
         val scroller = ScrollView(this).apply {
             isFillViewport = true
             clipToPadding = false
@@ -143,15 +183,15 @@ class MainActivity : Activity() {
             setPadding(dp(10), 0, 0, 0)
         }
         texts.addView(label("ORBIT", 20f, ink, true))
-        texts.addView(label("PERSONAL AI AGENT", 9f, muted, true).apply { letterSpacing = 0.12f })
+        texts.addView(label("Рабочее пространство", 11f, muted, false))
         bar.addView(texts, LinearLayout.LayoutParams(0, -2, 1f))
         val state = TextView(this).apply {
-            text = if (taskRunning) "● WORKING" else "● LOCAL CORE"
-            textSize = 9.5f
+            text = if (taskRunning) "Работает" else "Готов"
+            textSize = 11f
             typeface = Typeface.DEFAULT_BOLD
-            setTextColor(if (taskRunning) warning else accent)
+            setTextColor(if (taskRunning) Color.rgb(137, 87, 9) else Color.rgb(34, 113, 65))
             setPadding(dp(10), dp(8), dp(10), dp(8))
-            background = rounded(surfaceRaised, 24f, if (taskRunning) warning else accent, 1f)
+            background = rounded(if (taskRunning) Color.rgb(255, 244, 220) else Color.rgb(229, 246, 235), 10f, Color.TRANSPARENT, 0f)
         }
         bar.addView(state)
         return bar
@@ -162,9 +202,9 @@ class MainActivity : Activity() {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER
             setPadding(dp(10), dp(8), dp(10), dp(8))
-            background = rounded(Color.rgb(14, 21, 39), 18f, Color.rgb(33, 44, 70), 1f)
+            background = rounded(Color.WHITE, 14f, Color.rgb(226, 230, 236), 1f)
         }
-        nav.addView(navItem("⌂", "Задачи", Screen.HOME), LinearLayout.LayoutParams(0, -1, 1f))
+        nav.addView(navItem("•", "Задачи", Screen.HOME), LinearLayout.LayoutParams(0, -1, 1f))
         nav.addView(navItem("▤", "Файлы", Screen.FILES), LinearLayout.LayoutParams(0, -1, 1f))
         nav.addView(navItem("⚙", "Настройки", Screen.SETTINGS), LinearLayout.LayoutParams(0, -1, 1f))
         val wrap = LinearLayout(this).apply {
@@ -181,7 +221,7 @@ class MainActivity : Activity() {
             orientation = LinearLayout.VERTICAL
             gravity = Gravity.CENTER
             setPadding(dp(4), dp(3), dp(4), dp(3))
-            background = if (selected) rounded(Color.rgb(32, 53, 68), 13f, Color.TRANSPARENT, 0f) else null
+            background = if (selected) rounded(Color.rgb(232, 239, 255), 10f, Color.TRANSPARENT, 0f) else null
             isClickable = true
             isFocusable = true
             addView(label(symbol, 18f, if (selected) accent else muted, true))
@@ -195,11 +235,11 @@ class MainActivity : Activity() {
     }
 
     private fun buildHome(parent: LinearLayout) {
-        parent.addView(sectionLabel("AGENT CONSOLE", "01 / RUN"))
+        parent.addView(sectionLabel("Задачи", if (taskRunning) "Выполняется" else "Готов к запуску"))
         val hero = card()
-        hero.addView(label("Передай задачу.\nЗабери результат.", 27f, ink, true))
+        hero.addView(label("Что нужно сделать?", 24f, ink, true))
         hero.addView(spacer(9))
-        hero.addView(label("ORBIT планирует действия, вызывает инструменты и проверяет, что получилось.", 13f, muted, false))
+        hero.addView(label("ORBIT работает с файлами, вебом и доступными действиями Android. Результаты проверяются и сохраняются в проекте.", 13f, muted, false))
         hero.addView(spacer(14))
         val stats = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL; gravity = Gravity.CENTER_VERTICAL }
         stats.addView(metric("WORKSPACE", humanBytes(workspace.workspaceBytes()), accent), LinearLayout.LayoutParams(0, -2, 1f))
@@ -207,8 +247,8 @@ class MainActivity : Activity() {
         hero.addView(stats)
         parent.addView(hero, withTop(12))
 
-        parent.addView(label("Твоя задача", 19f, ink, true), withTop(22))
-        parent.addView(label("Напиши обычным языком. Агент сам выберет инструменты.", 12f, muted, false), withTop(4))
+        parent.addView(label("Новая задача", 19f, ink, true), withTop(22))
+        parent.addView(label("Опиши результат, который нужен. Агент выполнит действия доступными инструментами.", 12f, muted, false), withTop(4))
         val taskCard = card().apply { setPadding(dp(12), dp(12), dp(12), dp(12)) }
         val taskInput = editField("Например: найди документацию, создай структуру проекта и упакуй её в ZIP…", multiline = true).apply {
             minLines = 4
@@ -281,59 +321,295 @@ class MainActivity : Activity() {
     }
 
     private fun buildFiles(parent: LinearLayout) {
-        parent.addView(sectionLabel("WORKSPACE", "02 / FILES"))
-        parent.addView(label("Рабочее хранилище", 25f, ink, true), withTop(14))
-        parent.addView(label("Размер меняется по задаче. Проекты хранятся отдельно от кэша истории и настроек.", 12f, muted, false), withTop(4))
-        val info = card().apply { setPadding(dp(16), dp(16), dp(16), dp(16)) }
-        info.addView(label("РАЗМЕР РАБОЧИХ ФАЙЛОВ", 10f, accent, true))
-        info.addView(label(humanBytes(workspace.workspaceBytes()), 30f, ink, true), withTop(6))
-        info.addView(label("${workspace.root.walkTopDown().count { it.isFile }} файлов", 12f, muted, false), withTop(2))
-        info.addView(label(workspace.root.absolutePath, 10f, muted, false), withTop(8))
-        info.addView(actionButton("Экспортировать всё в ZIP", true) {
-            try {
-                pendingExport = workspace.createWorkspaceArchive()
-                val intent = Intent(Intent.ACTION_CREATE_DOCUMENT).apply {
-                    addCategory(Intent.CATEGORY_OPENABLE)
-                    type = "application/zip"
-                    putExtra(Intent.EXTRA_TITLE, "orbit-workspace.zip")
-                }
-                startActivityForResult(intent, EXPORT_REQUEST)
-            } catch (e: Exception) {
-                Toast.makeText(this, "Не удалось создать ZIP: ${e.message}", Toast.LENGTH_LONG).show()
-            }
-        }, LinearLayout.LayoutParams(-1, dp(48)).apply { topMargin = dp(14) })
+        parent.addView(sectionLabel("Файлы", "Проекты и результаты"))
+        parent.addView(label("Рабочие проекты", 23f, ink, true), withTop(12))
+        parent.addView(label("Каждая задача получает отдельную папку в workflow/project-…", 12f, muted, false), withTop(4))
+
+        val info = card()
+        info.addView(label("ЗАНЯТО", 10f, muted, true))
+        info.addView(label(humanBytes(workspace.workspaceBytes()), 28f, ink, true), withTop(4))
+        info.addView(label("${workspace.root.walkTopDown().count { it.isFile }} файлов · динамический размер", 12f, muted, false), withTop(2))
+        info.addView(actionButton("Сохранить всё в ZIP…", true) {
+            try { saveFileAs(workspace.createWorkspaceArchive(), "orbit-workspace.zip", true, "application/zip") }
+            catch (e: Exception) { Toast.makeText(this, "Не удалось создать ZIP: ${e.message}", Toast.LENGTH_LONG).show() }
+        }, LinearLayout.LayoutParams(-1, dp(46)).apply { topMargin = dp(12) })
         parent.addView(info, withTop(12))
 
-        parent.addView(label("Содержимое корня", 17f, ink, true), withTop(22))
-        val files = workspace.root.listFiles()?.sortedWith(compareBy<File>({ !it.isDirectory }, { it.name.lowercase() })).orEmpty()
+        val access = card()
+        access.addView(label("Доступ к файлам телефона", 16f, ink, true))
+        access.addView(label("Выбери папку, к которой нужен доступ. На Android 11+ корень Download нельзя выдать через выбор папки; для отдельного файла ORBIT откроет системный диалог сохранения или выбора файла.", 12f, muted, false), withTop(5))
+        access.addView(label("Выбрано: ${workspace.selectedExternalFolderName()}", 12f, if (workspace.hasExternalFolder()) Color.rgb(34, 113, 65) else muted, true), withTop(8))
+        access.addView(actionButton("Выбрать папку для файлов агента…", false) { selectExternalFolder() }, LinearLayout.LayoutParams(-1, dp(46)).apply { topMargin = dp(10) })
+        parent.addView(access, withTop(12))
+
+        var directory = runCatching {
+            if (currentDirectoryRel.isBlank()) workspace.root.canonicalFile else File(workspace.root, currentDirectoryRel).canonicalFile
+        }.getOrDefault(workspace.root)
+        if (directory != workspace.root && !directory.path.startsWith(workspace.root.canonicalPath + File.separator)) {
+            currentDirectoryRel = ""
+            directory = workspace.root.canonicalFile
+        }
+        if (currentDirectoryRel.isNotBlank()) {
+            parent.addView(actionButton("←  Назад", false) {
+                currentDirectoryRel = currentDirectoryRel.substringBeforeLast('/', "")
+                render()
+            }, LinearLayout.LayoutParams(-1, dp(42)).apply { topMargin = dp(12) })
+        }
+        parent.addView(label(if (currentDirectoryRel.isBlank()) "Рабочая папка" else currentDirectoryRel, 14f, ink, true), withTop(14))
+        parent.addView(label(directory.absolutePath, 10f, muted, false), withTop(3))
+
+        val files = directory.listFiles()
+            ?.filter { child ->
+                val canonical = runCatching { child.canonicalFile }.getOrNull() ?: return@filter false
+                canonical == workspace.root.canonicalFile || canonical.path.startsWith(workspace.root.canonicalPath + File.separator)
+            }
+            ?.sortedWith(compareBy<File>({ !it.isDirectory }, { it.name.lowercase() })).orEmpty()
         if (files.isEmpty()) {
             val empty = card()
-            empty.addView(label("Здесь пока пусто", 14f, ink, true))
-            empty.addView(label("Попроси агента создать файл или проект — результат появится здесь.", 12f, muted, false), withTop(6))
+            empty.addView(label("Папка пуста", 14f, ink, true))
+            empty.addView(label("Создай проект новой задачей или попроси агента создать файл.", 12f, muted, false), withTop(5))
             parent.addView(empty, withTop(8))
         } else {
-            files.take(60).forEach { file ->
+            files.take(100).forEach { file ->
                 val row = LinearLayout(this).apply {
                     orientation = LinearLayout.HORIZONTAL
                     gravity = Gravity.CENTER_VERTICAL
-                    setPadding(dp(12), dp(11), dp(12), dp(11))
-                    background = rounded(surface, 13f, Color.rgb(37, 49, 75), 1f)
+                    setPadding(dp(12), dp(10), dp(8), dp(10))
+                    background = rounded(Color.WHITE, 11f, Color.rgb(229, 232, 238), 1f)
+                    isClickable = true
+                    isFocusable = true
                 }
-                val symbol = label(if (file.isDirectory) "▰" else "▤", 20f, if (file.isDirectory) violet else accent, true)
-                row.addView(symbol, LinearLayout.LayoutParams(dp(32), -2))
+                row.addView(label(if (file.isDirectory) "▰" else "▤", 19f, if (file.isDirectory) violet else accent, true), LinearLayout.LayoutParams(dp(30), -2))
                 val column = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
                 column.addView(label(file.name, 13f, ink, true))
-                column.addView(label(if (file.isDirectory) "Папка" else humanBytes(file.length()), 10f, muted, false), withTop(3))
+                column.addView(label(if (file.isDirectory) "Папка" else humanBytes(file.length()), 11f, muted, false), withTop(2))
                 row.addView(column, LinearLayout.LayoutParams(0, -2, 1f))
-                parent.addView(row, withTop(7))
+                row.setOnClickListener {
+                    if (file.isDirectory) {
+                        currentDirectoryRel = workspace.root.toPath().relativize(file.canonicalFile.toPath()).toString().replace(File.separatorChar, '/')
+                        render()
+                    } else showFileActions(file)
+                }
+                row.addView(actionButton("⋯", false) { showFileActions(file) }, LinearLayout.LayoutParams(dp(46), dp(38)))
+                parent.addView(row, withTop(6))
             }
-            if (files.size > 60) parent.addView(label("Показаны первые 60 элементов.", 10f, muted, false), withTop(6))
+            if (files.size > 100) parent.addView(label("Показаны первые 100 элементов.", 11f, muted, false), withTop(6))
         }
-        parent.addView(label("Примечание: рабочая папка находится в app-specific storage Android. Для переноса файлов используй экспорт ZIP.", 11f, muted, false), withTop(18))
+    }
+
+    private fun showFileActions(file: File) {
+        val relative = workspace.root.toPath().relativize(file.canonicalFile.toPath()).toString().replace(File.separatorChar, '/')
+        val choices = if (file.isDirectory) arrayOf("Открыть папку", "Сохранить папку в ZIP…", "Удалить папку")
+            else arrayOf("Сохранить копию на устройстве…", "Предпросмотр текста", "Удалить файл")
+        AlertDialog.Builder(this)
+            .setTitle(file.name)
+            .setItems(choices) { _, which ->
+                if (file.isDirectory) when (which) {
+                    0 -> { currentDirectoryRel = relative; render() }
+                    1 -> try { saveFileAs(workspace.createItemArchive(relative), "${file.name}.zip", true, "application/zip") }
+                        catch (e: Exception) { Toast.makeText(this, "Ошибка ZIP: ${e.message}", Toast.LENGTH_LONG).show() }
+                    2 -> confirmDeleteWorkspaceItem(file)
+                } else when (which) {
+                    0 -> saveFileAs(file, file.name, false, mimeFor(file.name))
+                    1 -> previewWorkspaceFile(file)
+                    2 -> confirmDeleteWorkspaceItem(file)
+                }
+            }
+            .setNegativeButton("Отмена", null)
+            .show()
+    }
+
+    private fun confirmDeleteWorkspaceItem(file: File) {
+        val canonical = runCatching { file.canonicalFile }.getOrNull()
+        if (canonical == null || canonical == workspace.root.canonicalFile || canonical.path == File(workspace.root, "workflow").canonicalPath || !canonical.path.startsWith(workspace.root.canonicalPath + File.separator)) {
+            Toast.makeText(this, "Нельзя удалить корень рабочего пространства или workflow.", Toast.LENGTH_LONG).show()
+            return
+        }
+        AlertDialog.Builder(this)
+            .setTitle(if (file.isDirectory) "Удалить папку?" else "Удалить файл?")
+            .setMessage("Объект будет удалён из рабочей папки ORBIT. Это действие нельзя отменить.\n\n${file.name}")
+            .setNegativeButton("Отмена", null)
+            .setPositiveButton("Удалить") { _, _ ->
+                val removed = if (file.isDirectory) file.deleteRecursively() else file.delete()
+                Toast.makeText(this, if (removed) "Удалено" else "Не удалось удалить объект", Toast.LENGTH_SHORT).show()
+                render()
+            }.show()
+    }
+
+    private fun previewWorkspaceFile(file: File) {
+        if (file.length() > 200_000L) {
+            Toast.makeText(this, "Файл больше 200 КБ. Сохрани его отдельно для просмотра.", Toast.LENGTH_LONG).show()
+            return
+        }
+        val text = runCatching { file.readText(Charsets.UTF_8) }.getOrElse { "Не удалось прочитать как UTF-8: ${it.message}" }
+        val view = TextView(this).apply {
+            this.text = text.take(12_000)
+            setTextColor(ink)
+            textSize = 13f
+            setTextIsSelectable(true)
+            setPadding(dp(18), dp(12), dp(18), dp(12))
+        }
+        val scroll = ScrollView(this).apply { addView(view) }
+        AlertDialog.Builder(this).setTitle(file.name).setView(scroll).setPositiveButton("Готово", null).show()
+    }
+
+    private fun mimeFor(fileName: String): String {
+        val extension = fileName.substringAfterLast('.', "").lowercase()
+        return android.webkit.MimeTypeMap.getSingleton().getMimeTypeFromExtension(extension) ?: "application/octet-stream"
+    }
+
+    private fun saveFileAs(source: File, displayName: String, temporary: Boolean, mime: String) {
+        pendingExport = source
+        pendingExportIsTemp = temporary
+        val intent = Intent(Intent.ACTION_CREATE_DOCUMENT).apply {
+            addCategory(Intent.CATEGORY_OPENABLE)
+            type = mime
+            putExtra(Intent.EXTRA_TITLE, displayName)
+        }
+        try { startActivityForResult(intent, EXPORT_REQUEST) }
+        catch (e: Exception) {
+            pendingExport = null
+            pendingExportIsTemp = false
+            if (temporary) source.delete()
+            Toast.makeText(this, "Не удалось открыть окно сохранения: ${e.message}", Toast.LENGTH_LONG).show()
+        }
+    }
+
+    private fun selectExternalFolder(waiter: CountDownLatch? = null) {
+        pendingExternalFolderLatch = waiter
+        val intent = Intent(Intent.ACTION_OPEN_DOCUMENT_TREE).apply {
+            addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_GRANT_WRITE_URI_PERMISSION or Intent.FLAG_GRANT_PERSISTABLE_URI_PERMISSION)
+        }
+        try { startActivityForResult(intent, EXTERNAL_TREE_REQUEST) }
+        catch (e: Exception) {
+            pendingExternalFolderLatch?.countDown()
+            pendingExternalFolderLatch = null
+            Toast.makeText(this, "Окно выбора папки недоступно: ${e.message}", Toast.LENGTH_LONG).show()
+        }
+    }
+
+    private fun requestExternalWriteFromAgent(args: JSONObject): String {
+        val requestedPath = args.optString("path", "orbit-output.txt")
+        val fileName = requestedPath.replace('\\', '/').substringAfterLast('/')
+            .replace(Regex("[\\u0000-\\u001f]"), "_").take(120).ifBlank { "orbit-output.txt" }
+        val content = args.optString("content", "")
+        if (args.optBoolean("append", false)) return "Для добавления в существующий файл выбери постоянную SAF-папку в ORBIT и повтори операцию."
+        if (content.length > 1_000_000) return "Отклонено: один файл ограничен 1 000 000 символов."
+        val pending = PendingAgentWrite(fileName, content, CountDownLatch(1), AtomicReference("Сохранение отменено."))
+        mainHandler.post {
+            if (isFinishing || isDestroyed) {
+                pending.result.set("Отклонено: экран ORBIT уже закрыт.")
+                pending.latch.countDown()
+                return@post
+            }
+            pendingAgentWrite = pending
+            val intent = Intent(Intent.ACTION_CREATE_DOCUMENT).apply {
+                addCategory(Intent.CATEGORY_OPENABLE)
+                type = mimeFor(fileName)
+                putExtra(Intent.EXTRA_TITLE, fileName)
+            }
+            try { startActivityForResult(intent, AGENT_SAVE_REQUEST) }
+            catch (e: Exception) {
+                pendingAgentWrite = null
+                pending.result.set("Не удалось открыть системный диалог сохранения: ${e.message}")
+                pending.latch.countDown()
+            }
+        }
+        if (!pending.latch.await(5, TimeUnit.MINUTES)) {
+            mainHandler.post { if (pendingAgentWrite === pending) pendingAgentWrite = null }
+            return "Сохранение не завершено: системный диалог не вернул результат за 5 минут."
+        }
+        return pending.result.get()
+    }
+
+    private fun requestExternalDeleteFromAgent(requestedPath: String): String {
+        val pending = PendingAgentDelete(requestedPath, CountDownLatch(1), AtomicReference("Удаление отменено."))
+        mainHandler.post {
+            if (isFinishing || isDestroyed) {
+                pending.result.set("Отклонено: экран ORBIT уже закрыт.")
+                pending.latch.countDown()
+                return@post
+            }
+            pendingAgentDelete = pending
+            val intent = Intent(Intent.ACTION_OPEN_DOCUMENT).apply {
+                addCategory(Intent.CATEGORY_OPENABLE)
+                type = "*/*"
+                addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_GRANT_WRITE_URI_PERMISSION)
+            }
+            try { startActivityForResult(intent, AGENT_DELETE_REQUEST) }
+            catch (e: Exception) {
+                pendingAgentDelete = null
+                pending.result.set("Не удалось открыть выбор файла: ${e.message}")
+                pending.latch.countDown()
+            }
+        }
+        if (!pending.latch.await(5, TimeUnit.MINUTES)) {
+            mainHandler.post { if (pendingAgentDelete === pending) pendingAgentDelete = null }
+            return "Удаление не завершено: системный выбор файла не вернул результат за 5 минут."
+        }
+        return pending.result.get()
+    }
+
+    private fun requestExternalFolderFromAgent(): String? {
+        val latch = CountDownLatch(1)
+        mainHandler.post {
+            if (isFinishing || isDestroyed) { latch.countDown(); return@post }
+            AlertDialog.Builder(this)
+                .setTitle("ORBIT просит доступ к файлам")
+                .setMessage("Агент хочет работать с файлами вне своей рабочей папки. Выбери разрешённую папку в системном окне Android. ORBIT получит доступ только к выбранной папке и её содержимому.")
+                .setPositiveButton("Выбрать папку") { _, _ -> selectExternalFolder(latch) }
+                .setNegativeButton("Отказать") { _, _ -> latch.countDown() }
+                .setOnCancelListener { latch.countDown() }
+                .show()
+        }
+        if (!latch.await(5, TimeUnit.MINUTES)) return "Доступ к внешним файлам не был предоставлен вовремя."
+        return if (workspace.hasExternalFolder()) null else "Пользователь не выбрал папку общего хранилища. Не повторяй операцию; сообщи, что доступ не предоставлен."
+    }
+
+    private fun requestShizukuAccess() {
+        if (!ShizukuSupport.binderAvailable()) {
+            AlertDialog.Builder(this)
+                .setTitle("Shizuku не запущен")
+                .setMessage("Установи Shizuku, запусти его через Wireless Debugging/ADB, затем вернись сюда и выдай ORBIT разрешение.")
+                .setPositiveButton("Открыть загрузку") { _, _ -> startActivity(Intent(Intent.ACTION_VIEW, Uri.parse("https://shizuku.rikka.app/download/"))) }
+                .setNegativeButton("Отмена", null)
+                .show()
+            return
+        }
+        try {
+            if (ShizukuSupport.hasPermission()) {
+                ShizukuSupport.bindIfAllowed(this)
+                Toast.makeText(this, ShizukuSupport.status(), Toast.LENGTH_LONG).show()
+            } else {
+                Shizuku.requestPermission(ShizukuSupport.REQUEST_CODE)
+            }
+        } catch (e: Exception) {
+            Toast.makeText(this, "Shizuku: ${e.message ?: e.javaClass.simpleName}", Toast.LENGTH_LONG).show()
+        }
+    }
+
+    private fun isAssistantRoleHeld(): Boolean {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.Q) return false
+        return runCatching { getSystemService(RoleManager::class.java)?.isRoleHeld(RoleManager.ROLE_ASSISTANT) == true }.getOrDefault(false)
+    }
+
+    private fun requestAssistantRole() {
+        try {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                val manager = getSystemService(RoleManager::class.java)
+                if (manager != null && manager.isRoleAvailable(RoleManager.ROLE_ASSISTANT)) {
+                    startActivityForResult(manager.createRequestRoleIntent(RoleManager.ROLE_ASSISTANT), ASSISTANT_ROLE_REQUEST)
+                    return
+                }
+            }
+            startActivity(Intent(Settings.ACTION_MANAGE_DEFAULT_APPS_SETTINGS))
+        } catch (e: Exception) {
+            Toast.makeText(this, "Не удалось открыть выбор ассистента: ${e.message}", Toast.LENGTH_LONG).show()
+        }
     }
 
     private fun buildSettings(parent: LinearLayout) {
-        parent.addView(sectionLabel("CONFIGURATION", "03 / SETTINGS"))
+        parent.addView(sectionLabel("Настройки", "API и доступы"))
         parent.addView(label("Настройка агента", 25f, ink, true), withTop(14))
         parent.addView(label("API, автономность, память и локальные инструменты.", 12f, muted, false), withTop(4))
         val apiCard = card()
@@ -402,6 +678,15 @@ class MainActivity : Activity() {
         }
         autonomy.addView(allowCommandsCheck, withTop(12))
         autonomy.addView(label("Команды выполняются через /system/bin/sh под UID приложения, без root. Это не полноценная виртуальная машина и не жёсткая файловая песочница. Android не гарантирует наличие компиляторов.", 11f, muted, false), withTop(2))
+        allowShizukuCheck = CheckBox(this).apply {
+            text = "Разрешить команды через Shizuku"
+            isChecked = settingsStore.load().allowShizukuCommands
+            setTextColor(ink)
+            textSize = 14f
+            buttonTintList = android.content.res.ColorStateList.valueOf(warning)
+        }
+        autonomy.addView(allowShizukuCheck, withTop(12))
+        autonomy.addView(label("Запускает явно выбранные агентом команды под UID shell, если Shizuku запущен и разрешение выдано. Это расширяет доступ к системе; включай только если понимаешь последствия. Root при запуске Shizuku через Wireless Debugging не появляется.", 11f, muted, false), withTop(2))
         rememberChoicesCheck = CheckBox(this).apply {
             text = "Запоминать выбор и недавние задачи"
             isChecked = settingsStore.load().rememberChoices
@@ -414,7 +699,7 @@ class MainActivity : Activity() {
         parent.addView(autonomy, withTop(12))
 
         val device = card()
-        device.addView(label("УПРАВЛЕНИЕ ANDROID · БЕЗ ROOT", 10f, accent, true).apply { letterSpacing = 0.1f })
+        device.addView(label("Доступ к Android", 16f, ink, true))
         device.addView(label(if (AgentAccessibilityService.active != null) "Accessibility подключён" else "Accessibility пока выключен", 14f, if (AgentAccessibilityService.active != null) accent else warning, true), withTop(8))
         device.addView(label("Чтобы агент мог читать текущий экран, нажимать элементы и вводить текст, включи ORBIT в системных настройках специальных возможностей. Это действие требует ручного разрешения Android. Текст видимого экрана может быть отправлен выбранному API.", 11f, muted, false), withTop(6))
         device.addView(actionButton("Открыть настройки Accessibility", false) {
@@ -422,8 +707,12 @@ class MainActivity : Activity() {
         }, LinearLayout.LayoutParams(-1, dp(46)).apply { topMargin = dp(12) })
         device.addView(label("Рабочая папка", 11f, muted, true), withTop(16))
         device.addView(label(workspace.root.absolutePath, 10f, ink, false), withTop(4))
+        device.addView(label(ShizukuSupport.status(), 12f, if (ShizukuSupport.hasPermission()) Color.rgb(34, 113, 65) else muted, false), withTop(16))
+        device.addView(actionButton("Подключить / разрешить Shizuku", false) { requestShizukuAccess() }, LinearLayout.LayoutParams(-1, dp(46)).apply { topMargin = dp(8) })
+        device.addView(actionButton("Открыть настройки ассистента по умолчанию", false) { requestAssistantRole() }, LinearLayout.LayoutParams(-1, dp(46)).apply { topMargin = dp(8) })
+        device.addView(label(if (isAssistantRoleHeld()) "ORBIT выбран ассистентом по умолчанию." else "ORBIT можно выбрать системным ассистентом. На некоторых оболочках список ролей может отличаться.", 11f, muted, false), withTop(6))
         parent.addView(device, withTop(12))
-        parent.addView(label("Вся работа с моделью выполняется напрямую из APK. ORBIT не использует встроенный сервер или общий API-ключ разработчика.", 11f, muted, false), withTop(18))
+        parent.addView(label("Модель и история работают на выбранном API. Нативная библиотека используется для валидации путей и имён проектов; Kotlin-код остаётся внутри DEX.", 11f, muted, false), withTop(18))
     }
 
     private fun sectionLabel(title: String, right: String): View {
@@ -445,7 +734,7 @@ class MainActivity : Activity() {
     private fun card(): LinearLayout = LinearLayout(this).apply {
         orientation = LinearLayout.VERTICAL
         setPadding(dp(16), dp(16), dp(16), dp(16))
-        background = rounded(surface, 18f, Color.rgb(38, 49, 74), 1f)
+        background = rounded(surface, 14f, Color.rgb(229, 232, 238), 1f)
     }
 
     private fun label(text: String, size: Float, color: Int, bold: Boolean): TextView = TextView(this).apply {
@@ -463,9 +752,9 @@ class MainActivity : Activity() {
         this.hint = hint
         textSize = 13f
         setTextColor(ink)
-        setHintTextColor(Color.rgb(112, 125, 151))
-        setPadding(dp(12), dp(11), dp(12), dp(11))
-        background = rounded(Color.rgb(12, 19, 36), 12f, Color.rgb(47, 60, 88), 1f)
+        setHintTextColor(Color.rgb(137, 145, 158))
+        setPadding(dp(12), dp(10), dp(12), dp(10))
+        background = rounded(Color.WHITE, 10f, Color.rgb(215, 220, 229), 1f)
         minHeight = dp(if (multiline) 108 else 46)
         gravity = if (multiline) Gravity.TOP or Gravity.START else Gravity.CENTER_VERTICAL
         if (multiline) {
@@ -490,9 +779,9 @@ class MainActivity : Activity() {
         textSize = 13f
         typeface = Typeface.create("sans-serif-medium", Typeface.BOLD)
         gravity = Gravity.CENTER
-        setTextColor(if (primary) Color.rgb(8, 25, 31) else ink)
+        setTextColor(if (primary) Color.WHITE else ink)
         setPadding(dp(12), dp(9), dp(12), dp(9))
-        background = if (primary) rounded(accent, 13f, accent, 1f) else rounded(surfaceRaised, 13f, Color.rgb(65, 79, 111), 1f)
+        background = if (primary) rounded(accent, 10f, accent, 1f) else rounded(surfaceRaised, 10f, Color.rgb(221, 226, 235), 1f)
         isClickable = true
         isFocusable = true
         setOnClickListener { action() }
@@ -534,8 +823,13 @@ class MainActivity : Activity() {
             return
         }
         approveAllForTask = false
+        val projectPath = try { workspace.beginProject(task) } catch (e: Exception) {
+            Toast.makeText(this, "Не удалось создать проект: ${e.message}", Toast.LENGTH_LONG).show()
+            return
+        }
+        currentDirectoryRel = projectPath
         taskRunning = true
-        statusText = "Подготовка к задаче…"
+        statusText = "Проект $projectPath · подготовка…"
         activeTaskName = task
         val taskForAgent = expandTaskAlias(task)
         lastResult = ""
@@ -624,11 +918,22 @@ class MainActivity : Activity() {
                 Approval.DENY -> return "Пользователь отклонил действие $name. Продолжай другим безопасным способом или объясни ограничение."
             }
         }
-        return toolsExecute(name, args, settings.allowCommands)
+        if (name == "external_save_as") return requestExternalWriteFromAgent(args)
+        if (name == "external_delete_selected") return requestExternalDeleteFromAgent(args.optString("path", "не указан"))
+        if (name.startsWith("external_") && !workspace.hasExternalFolder()) {
+            when (name) {
+                "external_write" -> return requestExternalWriteFromAgent(args)
+                "external_delete" -> return requestExternalDeleteFromAgent(args.optString("path", "не указан"))
+                "external_folder_info" -> return toolsExecute(name, args, settings)
+            }
+            val accessResult = requestExternalFolderFromAgent()
+            if (accessResult != null) return accessResult
+        }
+        return toolsExecute(name, args, settings)
     }
 
-    private fun toolsExecute(name: String, args: JSONObject, allowCommands: Boolean): String {
-        return workspace.execute(name, args, allowCommands)
+    private fun toolsExecute(name: String, args: JSONObject, settings: AgentSettings): String {
+        return workspace.execute(name, args, settings.allowCommands, settings.allowShizukuCommands)
     }
 
     private fun saveSettings(showToast: Boolean) {
@@ -645,6 +950,7 @@ class MainActivity : Activity() {
             autoApprove = autoApproveCheck?.isChecked ?: current.autoApprove,
             allowCommands = allowCommandsCheck?.isChecked ?: current.allowCommands,
             rememberChoices = rememberChoicesCheck?.isChecked ?: current.rememberChoices,
+            allowShizukuCommands = allowShizukuCheck?.isChecked ?: current.allowShizukuCommands,
             maxSteps = stepCount
         )
         try {
@@ -746,18 +1052,107 @@ class MainActivity : Activity() {
     @Deprecated("Legacy document-picker callback is used for broad Android compatibility")
     override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
         super.onActivityResult(requestCode, resultCode, data)
+        if (requestCode == AGENT_SAVE_REQUEST) {
+            val pending = pendingAgentWrite
+            pendingAgentWrite = null
+            try {
+                val uri = if (resultCode == RESULT_OK) data?.data else null
+                if (pending == null) return
+                if (uri == null) {
+                    pending.result.set("Пользователь отменил сохранение файла.")
+                } else {
+                    contentResolver.openOutputStream(uri, "wt")?.bufferedWriter(Charsets.UTF_8)?.use { it.write(pending.content) }
+                        ?: throw IllegalStateException("Android не открыл файл для записи.")
+                    val savedName = runCatching { DocumentFile.fromSingleUri(this, uri)?.name }.getOrNull() ?: pending.fileName
+                    pending.result.set("Файл сохранён через системный диалог: $savedName")
+                }
+            } catch (e: Exception) {
+                pending?.result?.set("Ошибка сохранения файла: ${e.message}")
+            } finally {
+                pending?.latch?.countDown()
+            }
+            return
+        }
+        if (requestCode == AGENT_DELETE_REQUEST) {
+            val pending = pendingAgentDelete
+            val uri = if (resultCode == RESULT_OK) data?.data else null
+            if (pending == null) return
+            if (uri == null) {
+                pendingAgentDelete = null
+                pending.result.set("Пользователь отменил выбор файла для удаления.")
+                pending.latch.countDown()
+                return
+            }
+            val selectedName = runCatching { DocumentFile.fromSingleUri(this, uri)?.name }.getOrNull() ?: uri.lastPathSegment ?: "выбранный файл"
+            AlertDialog.Builder(this)
+                .setTitle("Подтвердить удаление файла?")
+                .setMessage("Запрошено: ${pending.requestedPath}\nВыбрано в системном окне: $selectedName\n\nУдалить именно выбранный файл? Отменить удаление нельзя.")
+                .setNegativeButton("Отмена") { _, _ ->
+                    pending.result.set("Удаление отменено пользователем.")
+                    pendingAgentDelete = null
+                    pending.latch.countDown()
+                }
+                .setPositiveButton("Удалить выбранный файл") { _, _ ->
+                    try {
+                        val deleted = DocumentsContract.deleteDocument(contentResolver, uri)
+                        pending.result.set(if (deleted) "Удалён выбранный файл: $selectedName" else "Поставщик документов не смог удалить: $selectedName")
+                    } catch (e: Exception) {
+                        pending.result.set("Не удалось удалить $selectedName: ${e.message}")
+                    } finally {
+                        pendingAgentDelete = null
+                        pending.latch.countDown()
+                    }
+                }
+                .setOnCancelListener {
+                    pending.result.set("Удаление отменено пользователем.")
+                    pendingAgentDelete = null
+                    pending.latch.countDown()
+                }
+                .show()
+            return
+        }
+        if (requestCode == EXTERNAL_TREE_REQUEST) {
+            try {
+                val treeUri = if (resultCode == RESULT_OK) data?.data else null
+                if (treeUri != null) {
+                    val grantedFlags = (data?.flags ?: 0) and
+                        (Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_GRANT_WRITE_URI_PERMISSION)
+                    contentResolver.takePersistableUriPermission(treeUri, grantedFlags)
+                    workspace.setExternalFolder(treeUri)
+                    Toast.makeText(this, "Доступ к папке сохранён: ${workspace.selectedExternalFolderName()}", Toast.LENGTH_LONG).show()
+                } else {
+                    Toast.makeText(this, "Папка не выбрана", Toast.LENGTH_SHORT).show()
+                }
+            } catch (e: Exception) {
+                Toast.makeText(this, "Не удалось сохранить доступ: ${e.message}", Toast.LENGTH_LONG).show()
+            } finally {
+                pendingExternalFolderLatch?.countDown()
+                pendingExternalFolderLatch = null
+                if (!isFinishing && screen == Screen.FILES) render()
+            }
+            return
+        }
+        if (requestCode == ASSISTANT_ROLE_REQUEST) {
+            Toast.makeText(this, if (isAssistantRoleHeld()) "ORBIT выбран ассистентом" else "Роль ассистента не назначена", Toast.LENGTH_LONG).show()
+            if (screen == Screen.SETTINGS) render()
+            return
+        }
         if (requestCode != EXPORT_REQUEST) return
         val source = pendingExport
+        val deleteTemp = pendingExportIsTemp
         pendingExport = null
+        pendingExportIsTemp = false
         val target = data?.data
-        if (resultCode != RESULT_OK || target == null || source == null) return
         try {
-            contentResolver.openOutputStream(target, "wt")?.use { out -> source.inputStream().use { it.copyTo(out) } }
-            Toast.makeText(this, "ZIP сохранён", Toast.LENGTH_LONG).show()
+            if (resultCode == RESULT_OK && target != null && source != null) {
+                contentResolver.openOutputStream(target, "wt")?.use { out -> source.inputStream().use { it.copyTo(out) } }
+                    ?: throw IllegalStateException("Android не открыл файл для записи.")
+                Toast.makeText(this, "Файл сохранён", Toast.LENGTH_LONG).show()
+            }
         } catch (e: Exception) {
-            Toast.makeText(this, "Ошибка экспорта: ${e.message}", Toast.LENGTH_LONG).show()
+            Toast.makeText(this, "Ошибка сохранения: ${e.message}", Toast.LENGTH_LONG).show()
         } finally {
-            source.delete()
+            if (deleteTemp) source?.delete()
         }
     }
 
@@ -775,5 +1170,9 @@ class MainActivity : Activity() {
 
     companion object {
         private const val EXPORT_REQUEST = 4201
+        private const val EXTERNAL_TREE_REQUEST = 4202
+        private const val ASSISTANT_ROLE_REQUEST = 4203
+        private const val AGENT_SAVE_REQUEST = 4204
+        private const val AGENT_DELETE_REQUEST = 4205
     }
 }

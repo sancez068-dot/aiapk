@@ -11,6 +11,7 @@ private const val SETTINGS_FILE = "orbit_settings"
     val autoApprove: Boolean = false,
     val allowCommands: Boolean = false,
     val rememberChoices: Boolean = true,
+    val allowShizukuCommands: Boolean = false,
     val maxSteps: Int = 10
 )
 
@@ -25,6 +26,7 @@ class SettingsStore(context: Context) {
         autoApprove = prefs.getBoolean("auto_approve", false),
         allowCommands = prefs.getBoolean("allow_commands", false),
         rememberChoices = prefs.getBoolean("remember_choices", true),
+        allowShizukuCommands = prefs.getBoolean("allow_shizuku_commands", false),
         maxSteps = prefs.getInt("max_steps", 10).coerceIn(2, 20)
     )
 
@@ -36,6 +38,7 @@ class SettingsStore(context: Context) {
             .putBoolean("auto_approve", settings.autoApprove)
             .putBoolean("allow_commands", settings.allowCommands)
             .putBoolean("remember_choices", settings.rememberChoices)
+            .putBoolean("allow_shizuku_commands", settings.allowShizukuCommands)
             .putInt("max_steps", settings.maxSteps.coerceIn(2, 20))
             .apply()
     }

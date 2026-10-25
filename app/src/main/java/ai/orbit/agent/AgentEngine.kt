@@ -22,7 +22,7 @@ class AgentEngine(
         val messages = JSONArray()
         messages.put(JSONObject().put("role", "system").put("content", buildSystemPrompt()))
         messages.put(JSONObject().put("role", "user").put("content", task.trim()))
-        val toolDefinitions = buildTools(settings.allowCommands)
+        val toolDefinitions = buildTools(settings.allowCommands, settings.allowShizukuCommands)
         var toolCount = 0
 
         for (step in 1..settings.maxSteps.coerceIn(2, 20)) {
@@ -89,9 +89,11 @@ class AgentEngine(
     private fun buildSystemPrompt(): String {
         val base = """
             Ты ORBIT — агент, который выполняет задачи с помощью предоставленных инструментов, а не просто советует.
-            Рабочая папка доступна через инструменты workspace_*. Все переданные пути относительны к ней.
+            Для текущей задачи создан отдельный проект в workflow/project-<slug>/. Все пути workspace_* без префикса workflow/ автоматически относятся к этой папке проекта; явные workflow/... относятся к корню workflow.
             Сначала уточни цель внутри себя и составь краткий план, затем выполняй работу инструментами.
-            Для фактов из интернета используй web_search/web_fetch; для файлов — workspace_list/read/write.
+            Для фактов из интернета используй web_search/web_fetch; для файлов — workspace_list/read/write. Создавай все новые файлы проекта внутри текущей папки проекта, а не в корне workspace.
+            Для внешних файлов используй SAF-инструменты. external_write/external_delete работают относительно папки, выбранной пользователем. Если пользователь указывает конкретное место сохранения (например, Download), используй external_save_as: Android откроет диалог сохранения и пользователь сам выберет итоговый путь. Для удаления отдельного существующего файла вне выбранной папки используй external_delete_selected: Android предложит выбрать файл, затем ORBIT покажет дополнительное подтверждение с именем файла. Не утверждай, что получил доступ ко всему хранилищу.
+            Если разрешены privileged-команды, shizuku_command выполняется под UID shell через Shizuku, что даёт больше прав, но не root само по себе. Не используй его для разрушительных системных изменений.
             После изменения файлов перечитай или проверь их подходящим инструментом. Не утверждай, что сделал то, чего инструмент не подтвердил.
             Для сборки проектов используй run_command, если инструмент доступен, но учитывай, что Android может не содержать компиляторы и SDK.
             Инструменты screen_read/ui_* работают только после того, как пользователь вручную включил Accessibility для ORBIT.
@@ -124,7 +126,7 @@ class AgentEngine(
         }
     }
 
-    private fun buildTools(includeCommand: Boolean): JSONArray {
+    private fun buildTools(includeCommand: Boolean, includeShizuku: Boolean): JSONArray {
         val array = JSONArray()
         fun add(name: String, description: String, properties: JSONObject, required: List<String> = emptyList()) {
             val parameters = JSONObject().put("type", "object").put("properties", properties).put("additionalProperties", false)
@@ -153,6 +155,18 @@ class AgentEngine(
         add("workspace_unzip", "Распаковывает ZIP в рабочую папку с защитой от zip-slip.", JSONObject()
             .put("archive", stringProp("Относительный путь к ZIP."))
             .put("destination", stringProp("Необязательная целевая папка.")), listOf("archive"))
+        add("external_folder_info", "Показывает папку общего хранилища Android, которую пользователь отдельно разрешил через системный выбор папки.", JSONObject())
+        add("external_list", "Показывает элементы внутри выбранной пользователем общей папки. path — относительный путь внутри неё.", JSONObject().put("path", stringProp("Относительный путь к выбранной папке; пустая строка — корень.")))
+        add("external_read", "Читает текстовый файл из папки, выбранной пользователем в системном окне Android.", JSONObject().put("path", stringProp("Относительный путь к файлу.")).put("max_chars", intProp("Максимум символов, 500–20000.")), listOf("path"))
+        add("external_write", "Создаёт или перезаписывает UTF-8 файл внутри выбранной пользователем папки общего хранилища. Родительские папки создаются автоматически.", JSONObject().put("path", stringProp("Относительный путь внутри выбранной папки.")).put("content", stringProp("Содержимое файла.")).put("append", boolProp("true — добавить в конец.")), listOf("path", "content"))
+        add("external_mkdir", "Создаёт папку внутри выбранной пользователем папки общего хранилища.", JSONObject().put("path", stringProp("Относительный путь новой папки.")), listOf("path"))
+        add("external_delete", "Удаляет файл или подпапку внутри выбранной пользователем папки общего хранилища. Не может удалить выбранный корень.", JSONObject().put("path", stringProp("Относительный путь удаляемого файла/папки.")), listOf("path"))
+        add("external_save_as", "Создаёт один файл и открывает системный диалог Android, чтобы пользователь выбрал точное место сохранения. Используй для конкретного места, например Download.", JSONObject()
+            .put("path", stringProp("Желаемый путь/имя файла; в диалоге используется имя файла."))
+            .put("content", stringProp("Полное содержимое UTF-8 файла.")), listOf("path", "content"))
+        add("external_delete_selected", "Открывает системный выбор существующего файла и показывает отдельное подтверждение удаления. Используй для файла вне выбранной папки; пользователь выбирает точный файл сам.", JSONObject()
+            .put("path", stringProp("Путь/имя файла, который пользователь просил удалить; он показывается в подтверждении.")), listOf("path"))
+        if (includeShizuku) add("shizuku_command", "Выполняет shell-команду под UID Shizuku (обычно UID shell), если пользователь установил Shizuku и выдал разрешение. Это расширенный доступ, не root.", JSONObject().put("command", stringProp("Команда shell.")), listOf("command"))
         add("web_search", "Ищет публичные веб-страницы через DuckDuckGo HTML и возвращает заголовки/URL.", JSONObject().put("query", stringProp("Поисковый запрос.")), listOf("query"))
         add("web_fetch", "Загружает публичный HTTPS URL и возвращает текст страницы; localhost и частные IP блокируются.", JSONObject()
             .put("url", stringProp("Полный URL http(s)."))

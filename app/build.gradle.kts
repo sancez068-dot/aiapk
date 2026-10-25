@@ -6,18 +6,30 @@ plugins {
 android {
     namespace = "ai.orbit.agent"
     compileSdk = 36
+    ndkVersion = "27.2.12479018"
 
     defaultConfig {
         applicationId = "ai.orbit.agent"
         minSdk = 26
         targetSdk = 36
-        versionCode = 1
-        versionName = "1.0.0"
+        versionCode = 2
+        versionName = "1.1.0"
+        ndk { abiFilters += setOf("arm64-v8a", "armeabi-v7a", "x86_64") }
+        externalNativeBuild {
+            cmake { cppFlags += "-std=c++17" }
+        }
+    }
+
+    buildFeatures { aidl = true }
+
+    externalNativeBuild {
+        cmake { path = file("src/main/cpp/CMakeLists.txt"); version = "3.22.1" }
     }
 
     buildTypes {
         release {
-            isMinifyEnabled = false
+            isMinifyEnabled = true
+            isShrinkResources = true
             proguardFiles(
                 getDefaultProguardFile("proguard-android-optimize.txt"),
                 "proguard-rules.pro"
@@ -26,6 +38,8 @@ android {
         debug {
             applicationIdSuffix = ".debug"
             versionNameSuffix = "-debug"
+            isMinifyEnabled = true
+            proguardFiles(getDefaultProguardFile("proguard-android-optimize.txt"), "proguard-rules.pro")
         }
     }
 
@@ -45,4 +59,8 @@ android {
     }
 }
 
-dependencies { }
+dependencies {
+    implementation("androidx.documentfile:documentfile:1.0.1")
+    implementation("dev.rikka.shizuku:api:13.1.5")
+    implementation("dev.rikka.shizuku:provider:13.1.5")
+}
