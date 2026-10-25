@@ -1,0 +1,4 @@
+<resources>
+    <string name="app_name">ORBIT Agent</string>
+    <string name="accessibility_description">Разрешает ORBIT читать текст активного экрана и выполнять команды интерфейса, запрошенные пользователем.</string>
+</resources>
