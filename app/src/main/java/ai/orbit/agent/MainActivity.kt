@@ -4,6 +4,7 @@ import android.app.Activity
 import android.app.AlertDialog
 import android.app.role.RoleManager
 import android.content.Intent
+import android.speech.RecognizerIntent
 import android.graphics.Color
 import android.graphics.Typeface
 import android.graphics.drawable.GradientDrawable
@@ -111,14 +112,17 @@ class MainActivity : Activity() {
         secrets = SecureSecretStore(this)
         workspace = WorkspaceTools(this)
         try { Shizuku.addRequestPermissionResultListener(shizukuPermissionListener) } catch (_: Exception) { }
+        var launchVoiceForAssistant = false
         if (intent?.action == Intent.ACTION_ASSIST) {
             taskDraft = intent.getStringExtra(Intent.EXTRA_TEXT)
                 ?: intent.getCharSequenceExtra("android.intent.extra.ASSIST_INPUT_HINT_KEY")?.toString().orEmpty()
-            if (taskDraft.isBlank()) taskDraft = "Помоги выполнить задачу на телефоне"
+            launchVoiceForAssistant = taskDraft.isBlank()
+            if (taskDraft.isBlank()) taskDraft = ""
             screen = Screen.HOME
         }
         loadMemory()
         render()
+        if (launchVoiceForAssistant) mainHandler.post { startVoiceInput() }
     }
 
     override fun onResume() {
@@ -259,6 +263,7 @@ class MainActivity : Activity() {
         }
         taskInputView = taskInput
         taskCard.addView(taskInput, LinearLayout.LayoutParams(-1, -2))
+        taskCard.addView(actionButton("Голосовой ввод", false) { startVoiceInput() }, LinearLayout.LayoutParams(-1, dp(42)).apply { topMargin = dp(8) })
         taskCard.addView(spacer(10))
         val actionRow = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL; gravity = Gravity.CENTER_VERTICAL }
         actionRow.addView(actionButton(if (taskRunning) "АГЕНТ РАБОТАЕТ" else "Запустить агента", true) {
@@ -324,6 +329,12 @@ class MainActivity : Activity() {
         parent.addView(sectionLabel("Файлы", "Проекты и результаты"))
         parent.addView(label("Рабочие проекты", 23f, ink, true), withTop(12))
         parent.addView(label("Каждая задача получает отдельную папку в workflow/project-…", 12f, muted, false), withTop(4))
+
+        val importCard = card()
+        importCard.addView(label("Входные файлы", 16f, ink, true))
+        importCard.addView(label("Выбери файл, несколько файлов или ZIP. ORBIT скопирует их в workflow/inbox, чтобы агент мог прочитать текст, распаковать архив и использовать исходники при выполнении задачи.", 12f, muted, false), withTop(5))
+        importCard.addView(actionButton("Загрузить файлы / ZIP…", true) { selectInputFiles() }, LinearLayout.LayoutParams(-1, dp(46)).apply { topMargin = dp(10) })
+        parent.addView(importCard, withTop(12))
 
         val info = card()
         info.addView(label("ЗАНЯТО", 10f, muted, true))
@@ -564,6 +575,60 @@ class MainActivity : Activity() {
         }
         if (!latch.await(5, TimeUnit.MINUTES)) return "Доступ к внешним файлам не был предоставлен вовремя."
         return if (workspace.hasExternalFolder()) null else "Пользователь не выбрал папку общего хранилища. Не повторяй операцию; сообщи, что доступ не предоставлен."
+    }
+
+    private fun startVoiceInput() {
+        val intent = Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH).apply {
+            putExtra(RecognizerIntent.EXTRA_LANGUAGE_MODEL, RecognizerIntent.LANGUAGE_MODEL_FREE_FORM)
+            putExtra(RecognizerIntent.EXTRA_LANGUAGE, java.util.Locale.getDefault().toLanguageTag())
+            putExtra(RecognizerIntent.EXTRA_LANGUAGE_PREFERENCE, java.util.Locale.getDefault().toLanguageTag())
+            putExtra(RecognizerIntent.EXTRA_PROMPT, "Скажите, что должен сделать ORBIT")
+            putExtra(RecognizerIntent.EXTRA_MAX_RESULTS, 3)
+        }
+        try {
+            startActivityForResult(intent, VOICE_INPUT_REQUEST)
+        } catch (_: Exception) {
+            Toast.makeText(this, "Распознавание речи недоступно. Проверь Google app / Speech Services by Google.", Toast.LENGTH_LONG).show()
+        }
+    }
+
+    private fun selectInputFiles() {
+        val intent = Intent(Intent.ACTION_OPEN_DOCUMENT).apply {
+            addCategory(Intent.CATEGORY_OPENABLE)
+            type = "*/*"
+            putExtra(Intent.EXTRA_ALLOW_MULTIPLE, true)
+            addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+        }
+        try { startActivityForResult(intent, INPUT_FILES_REQUEST) }
+        catch (e: Exception) { Toast.makeText(this, "Не удалось открыть выбор файлов: ${e.message}", Toast.LENGTH_LONG).show() }
+    }
+
+    private fun importSelectedUris(data: Intent?): String {
+        val uris = ArrayList<Uri>()
+        data?.clipData?.let { clip -> for (i in 0 until clip.itemCount) clip.getItemAt(i).uri?.let(uris::add) }
+        if (uris.isEmpty()) data?.data?.let(uris::add)
+        if (uris.isEmpty()) return "Файлы не выбраны."
+        val inbox = File(workspace.root, "workflow/inbox").canonicalFile
+        if (!inbox.path.startsWith(workspace.root.canonicalPath + File.separator)) throw IllegalArgumentException("Некорректная папка импорта.")
+        inbox.mkdirs()
+        val imported = ArrayList<String>()
+        for (uri in uris.take(30)) {
+            val rawName = runCatching { DocumentFile.fromSingleUri(this, uri)?.name }.getOrNull()
+                ?: uri.lastPathSegment?.substringAfterLast('/') ?: "uploaded-file"
+            val safeName = rawName.replace(Regex("[^A-Za-z0-9А-Яа-я._() -]"), "_").trim().take(120).ifBlank { "uploaded-file" }
+            var target = File(inbox, safeName)
+            var suffix = 2
+            while (target.exists()) {
+                val ext = target.extension.takeIf { it.isNotBlank() }?.let { ".$it" }.orEmpty()
+                val base = target.name.removeSuffix(ext)
+                target = File(inbox, "$base-$suffix$ext")
+                suffix++
+            }
+            contentResolver.openInputStream(uri)?.use { input -> target.outputStream().buffered().use { output -> input.copyTo(output) } }
+                ?: throw IllegalStateException("Android не открыл файл: $safeName")
+            imported.add("${target.name} (${humanBytes(target.length())})")
+        }
+        return "Импортировано ${imported.size} файл(ов) в workflow/inbox/:\n" + imported.joinToString("\n") + if (uris.size > 30) "\nОстальные файлы не импортированы: лимит 30 за раз." else ""
     }
 
     private fun requestShizukuAccess() {
@@ -1052,6 +1117,29 @@ class MainActivity : Activity() {
     @Deprecated("Legacy document-picker callback is used for broad Android compatibility")
     override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
         super.onActivityResult(requestCode, resultCode, data)
+        if (requestCode == VOICE_INPUT_REQUEST) {
+            if (resultCode == RESULT_OK) {
+                val spoken = data?.getStringArrayListExtra(RecognizerIntent.EXTRA_RESULTS)?.firstOrNull().orEmpty()
+                if (spoken.isNotBlank()) {
+                    taskDraft = if (taskDraft.isBlank()) spoken else "$taskDraft\n$spoken"
+                    screen = Screen.HOME
+                    render()
+                    taskInputView?.setSelection(taskInputView?.text?.length ?: 0)
+                }
+            }
+            return
+        }
+        if (requestCode == INPUT_FILES_REQUEST) {
+            if (resultCode == RESULT_OK) {
+                try {
+                    Toast.makeText(this, importSelectedUris(data), Toast.LENGTH_LONG).show()
+                } catch (e: Exception) {
+                    Toast.makeText(this, "Ошибка импорта: ${e.message}", Toast.LENGTH_LONG).show()
+                }
+            }
+            if (screen == Screen.FILES) render()
+            return
+        }
         if (requestCode == AGENT_SAVE_REQUEST) {
             val pending = pendingAgentWrite
             pendingAgentWrite = null
@@ -1174,5 +1262,7 @@ class MainActivity : Activity() {
         private const val ASSISTANT_ROLE_REQUEST = 4203
         private const val AGENT_SAVE_REQUEST = 4204
         private const val AGENT_DELETE_REQUEST = 4205
+        private const val VOICE_INPUT_REQUEST = 4206
+        private const val INPUT_FILES_REQUEST = 4207
     }
 }
